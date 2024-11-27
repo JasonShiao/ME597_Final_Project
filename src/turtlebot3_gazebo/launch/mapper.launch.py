@@ -14,6 +14,7 @@ def generate_launch_description():
 
     # Get the path to the environment launch file
     env_launch_file = os.path.join(package_dir, 'launch', 'turtlebot3_house.launch.py')
+    slam_params_file = os.path.join(package_dir, 'params', 'mapper_params_online_async.yaml')
 
     # Define configurable parameters
     use_sim_time = LaunchConfiguration('use_sim_time', default='true')
@@ -32,7 +33,8 @@ def generate_launch_description():
                 get_package_share_directory('slam_toolbox'),
                 '/launch/online_async_launch.py'
             ]),
-            launch_arguments={'use_sim_time': use_sim_time}.items()
+            launch_arguments={'use_sim_time': use_sim_time,
+                              'slam_params_file': slam_params_file}.items()
         ),
 
         # Launch your mapping algorithm
