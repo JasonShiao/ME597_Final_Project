@@ -85,7 +85,7 @@ class Task1(Node):
             else:
                 pass
         self.robot_pose_trans = self.odom_trans @ self.robot_base_trans
-        self.get_logger().info(f"Robot pose: {self.robot_pose_trans}")
+        #self.get_logger().info(f"Robot pose: {self.robot_pose_trans}")
 
     def map_callback(self, grid_map_msg: OccupancyGrid):
         self.get_logger().info("Map received")
@@ -93,8 +93,12 @@ class Task1(Node):
         map_data = np.where(map_data == -1, 128, map_data) # substitute -1 with 128 for unexplored location
         map_data = np.where(map_data == 0, 255, map_data) # substitute -1 with 128 for unexplored location
         map_data = np.where(map_data == 1, 0, map_data) # substitute -1 with 128 for unexplored location
-        #cv2.imshow('Grid map', cv2.resize(map_data.astype(np.uint8),  (grid_map_msg.info.height*3, grid_map_msg.info.width*3), interpolation=cv2.INTER_NEAREST))
-        #cv2.waitKey(1) # Must exist for imshow to work
+        # Flip y-axis for display from bottom to top (align with rViz and gazebo)
+        cv2.imshow('Grid map', cv2.flip(
+            cv2.resize(map_data.astype(np.uint8),  (grid_map_msg.info.height*3, grid_map_msg.info.width*3), interpolation=cv2.INTER_NEAREST), 
+            0)
+        )
+        cv2.waitKey(1) # Must exist for imshow to work
     
     def map_grid_pos_to_real_pos(grid_x_idx, grid_y_idx, origin: Pose, resolution):
         # real x, y in grid origin coordinate
