@@ -52,146 +52,10 @@ def inverseTrans(T):
     return T_inv
 
 
-class MapMark(IntEnum):
-    MAP_OPEN = 0
-    MAP_CLOSE = 1
-    FRONTIER_OPEN = 2
-    FRONTIER_CLOSE = 3
-
-class CellState(IntEnum):
+class CellType(IntEnum):
     UNKNOWN = -1
     FREE = 0
     OCCUPIED = 100
-
-class Frontier():
-    def __init__(self):
-        self.points = []
-        self.min_distance = np.inf
-        self.centroid = (0, 0)
-        self.middle = (0, 0)
-
-    def size(self):
-        return 1 if len(self.points) == 0 else len(self.points)
-    
-    def getCentroid(self):
-        pass
-
-    def getMinDistance(self):
-        return self.min_distance
-
-
-def WFDFrontierExtract(map: OccupancyGrid, robot_pos: tuple, min_frontier_size=0.4):
-    """
-    Extract frontier points from the map
-    :param map: OccupancyGrid message
-    :param robot_pos: robot position (x,y) in map frame
-    :param min_frontier_size: minimum frontier size (in real world unit m) to be considered as a frontier
-    :return: list of frontiers, each frontier is a list of points
-    """
-    def getAdjacent(p: tuple, diag = False):
-        # 8 adjacent points if diag is True, 4 adjacent points if diag is False
-        x, y = p
-        neighbor = []
-        neighbor.append((x-1, y))
-        neighbor.append((x, y-1))
-        neighbor.append((x, y+1))
-        neighbor.append((x+1, y))
-        if diag:
-            neighbor.append((x-1, y-1))
-            neighbor.append((x-1, y+1))
-            neighbor.append((x+1, y-1))
-            neighbor.append((x+1, y+1))
-        return neighbor
-    
-    def isFrontier(p: tuple, map_data: np.ndarray):
-        x, y = p
-        # if at unexplored cell and there is at least one free grid in the "4" adjacent/reachable cells
-        if x < 0 or x >= map_data.shape[1] or y < 0 or y >= map_data.shape[0]:
-            return False
-        if map_data[y, x] != CellState.UNKNOWN:
-            return False
-        adj = getAdjacent(p, diag=False)
-        for n in adj:
-            x, y = n
-            if x < 0 or x >= map_data.shape[1] or y < 0 or y >= map_data.shape[0]:
-                continue
-            if map_data[y, x] == CellState.FREE:
-                return True
-        return False
-
-    def buildFrontier(initial_point: tuple, robot_pos: tuple, map_data: np.ndarray, marker: dict):
-        new_frontier = Frontier()
-        frontier_q = queue.Queue()
-        frontier_q.put(initial_point)
-        marker[initial_point] = MapMark.FRONTIER_OPEN
-        while not frontier_q.empty():
-            p = frontier_q.get()
-            if p in marker and marker[p] in [MapMark.MAP_CLOSE, MapMark.FRONTIER_CLOSE]:
-                continue
-            if isFrontier(p, map_data):
-                new_frontier.points.append(p)
-                x, y = p
-                # centroid
-                new_frontier.centroid = (new_frontier.centroid[0] + x, new_frontier.centroid[1] + y)
-                # calculate the distance from the robot to the frontier
-                distance = np.sqrt((x - robot_pos[0])**2 + (y - robot_pos[1])**2)
-                if distance < new_frontier.min_distance:
-                    new_frontier.min_distance = distance
-                    new_frontier.middle = p
-                for w in getAdjacent(p, diag=True):
-                    if w not in marker or marker[w] not in [MapMark.FRONTIER_OPEN, MapMark.FRONTIER_CLOSE, MapMark.MAP_CLOSE]:
-                        frontier_q.put(w)
-                        marker[w] = MapMark.FRONTIER_OPEN
-                marker[p] = MapMark.FRONTIER_CLOSE
-        for f_point in new_frontier.points:
-            marker[f_point] = MapMark.MAP_CLOSE
-        
-        # Finalize the centroid
-        new_frontier.centroid = (round(new_frontier.centroid[0] / new_frontier.size()), round(new_frontier.centroid[1] / new_frontier.size()))
-        return new_frontier
-
-    # Note: in (y, x) format
-    map_data = np.array(map.data).reshape((map.info.height, map.info.width))
-    # Dilate the map for clearance
-    occupied_mask = (map_data == CellState.OCCUPIED)
-    dilation_mask = binary_dilation(occupied_mask, structure=np.ones((9,9)))
-    dilated_map_data = np.copy(map_data)
-    dilated_map_data[dilation_mask] = CellState.OCCUPIED
-    dilated_map_data[map_data == CellState.UNKNOWN] = CellState.UNKNOWN
-
-    map_q = queue.Queue()
-    frontiers: list[Frontier] = []
-    marker = {}
-    idx_x, idx_y = real_pose_to_map_grid_pos(robot_pos[0], robot_pos[1], map.info.origin, map.info.resolution)
-    map_q.put((idx_x, idx_y))
-    marker[(idx_x, idx_y)] = MapMark.MAP_OPEN
-    while not map_q.empty():
-        p: tuple = map_q.get()
-        if p in marker and marker[p] == MapMark.MAP_CLOSE:
-            continue
-        if isFrontier(p, dilated_map_data):
-            # For a frontier point p, bfs to find all connected frontier points
-            new_frontier = buildFrontier(p, robot_pos, dilated_map_data, marker)
-            # Ignore small frontiers
-            if new_frontier.size() * map.info.resolution >= min_frontier_size:
-                frontiers.append(new_frontier)
-        for v in getAdjacent(p, diag=True):
-            if (v not in marker or marker[v] not in [MapMark.MAP_OPEN, MapMark.MAP_CLOSE]):
-                # check if v has at least one free space neighbor (4 adjacent grids)
-                reachable_neighbor = getAdjacent(v, diag=False)
-                v_reachable = False
-                for n in reachable_neighbor:
-                    x, y = n
-                    if (x >= 0 and x < dilated_map_data.shape[1] and y >= 0 and y < dilated_map_data.shape[0]) \
-                       and dilated_map_data[y, x] == CellState.FREE:
-                        v_reachable = True
-                        break
-                if v_reachable:
-                    map_q.put(v)
-                    marker[v] = MapMark.MAP_OPEN
-        marker[p] = MapMark.MAP_CLOSE
-    
-    return frontiers
 
 
 def map_grid_pos_to_real_pos(grid_x_idx, grid_y_idx, origin: Pose, resolution):
@@ -212,6 +76,108 @@ def real_pose_to_map_grid_pos(real_x, real_y, origin: Pose, resolution):
     grid_y_idx = round(pos[1] / resolution)
     return grid_x_idx, grid_y_idx
 
+class RRTNode():
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        #self.parent = None
+        #self.children = []
+    
+    def position(self):
+        return (self.x, self.y)
+    
+class RRT():
+    def __init__(self, step_size):
+        self.edges: list[tuple[RRTNode, RRTNode]] = []
+        self.nodes: list[RRTNode] = []
+        self.step_size = step_size
+    
+    def insert_node(self, new_node: RRTNode, parent_node: RRTNode):
+        if parent_node:
+            self.edges.append((parent_node, new_node))
+            #self.nodes[parent_node.id()].children.append(new_node)
+            #new_node.parent = parent_node
+        else: # set root node -> reset the tree
+            self.edges = []
+            self.nodes = []
+        self.nodes.append(new_node)
+    
+    def nearest_node(self, x, y):
+        nearest_node = None
+        nearest_dist = float('inf')
+        for node in self.nodes:
+            dist = (node.x - x)**2 + (node.y - y)**2
+            if dist < nearest_dist:
+                nearest_dist = dist
+                nearest_node = node
+        return nearest_node
+    
+    def move(self, node, target_point):
+        dx = target_point[0] - node.x
+        dy = target_point[1] - node.y
+        # move with step size along the direction from node to target_point
+        dist = np.sqrt(dx**2 + dy**2)
+        if dist > self.step_size:
+            dx = dx / dist * self.step_size
+            dy = dy / dist * self.step_size
+        else: # dist smaller than step size
+            pass
+        return node.x + dx, node.y + dy
+    
+    def is_obstacle_free(self, node, target_point, map_data, map_info):
+        # Bresenham's line algorithm
+        x0_grid, y0_grid = real_pose_to_map_grid_pos(*(node.position()), map_info.origin, map_info.resolution)
+        x1_grid, y1_grid = real_pose_to_map_grid_pos(*target_point, map_info.origin, map_info.resolution)
+        dx = abs(x1_grid - x0_grid)
+        dy = abs(y1_grid - y0_grid)
+        if x0_grid < x1_grid:
+            sx = 1
+        else:
+            sx = -1
+        if y0_grid < y1_grid:
+            sy = 1
+        else:
+            sy = -1
+        err = dx - dy
+        while True:
+            if y0_grid < 0 or y0_grid >= map_data.shape[0] or x0_grid < 0 or x0_grid >= map_data.shape[1]:
+                return False
+            if map_data[y0_grid, x0_grid] == CellType.OCCUPIED:
+                return False
+            if x0_grid == x1_grid and y0_grid == y1_grid:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err = err - dy
+                x0_grid = x0_grid + sx
+            if e2 < dx:
+                err = err + dx
+                y0_grid = y0_grid + sy
+        return True
+
+    def is_unknown_region(self, x, y, map_data, map_info):
+        x_grid, y_grid = real_pose_to_map_grid_pos(x, y, map_info.origin, map_info.resolution)
+        return map_data[y_grid, x_grid] == CellType.UNKNOWN
+    
+    def explore(self, map_data, map_info): # grow the tree with one step
+        p_rand = (np.random.rand() * map_info.resolution * map_data.shape[1], np.random.rand() * map_info.resolution * map_data.shape[1])
+        # Get nearest point from tree to p_rand
+        nearest_node = self.nearest_node(*p_rand)
+        # Move from nearest node to p_rand
+        p_new = self.move(nearest_node, p_rand)
+        frontier_found = False
+        if self.is_obstacle_free(nearest_node, p_new, map_data, map_info):
+            new_node = RRTNode(*p_new)
+            #self.insert_node(new_node, nearest_node)
+            if self.is_unknown_region(*p_new, map_data, map_info):
+                frontier_found = True
+                #self.frontier_points.append(p_new)
+                #self.insert_node(RRTNode(*self.robot_current_position), None)
+        if frontier_found:
+            return p_new
+        else:
+            return None
+
 
 class Task1(Node):
     """
@@ -219,7 +185,9 @@ class Task1(Node):
     """
     def __init__(self):
         super().__init__('task1_node')
-        self.timer = self.create_timer(0.1, self.timer_cb)
+        #self.frontier_explore_timer = self.create_timer(0.5, self.frontier_explore_timer_cb)
+        self.global_frontier_explore_timer = self.create_timer(1, self.global_frontier_explore_timer_cb)
+        #self.navigation_timer = self.create_timer(0.2, self.navigation_timer_cb)
         # Fill in the initialization member variables that you need
         self.map_subscriber = self.create_subscription(
             OccupancyGrid,
@@ -234,16 +202,137 @@ class Task1(Node):
             10
         )
         self.frontier_pub = self.create_publisher(MarkerArray, '/frontier', 3)
+        self.rrt_pub = self.create_publisher(MarkerArray, '/rrt', 3)
 
         self.odom_trans = np.eye(4)       # map (world) frame to odom frame
         self.robot_base_trans = np.eye(4) # odom frame to robot base frame
         self.robot_pose_trans = np.eye(4) # map (world) frame to robot base frame
 
+        self.robot_current_position = None # in real world coord
+        self.last_process_position = None
+        self.current_goal = None
+        self.map: OccupancyGrid = None
+        self.map_data: np.ndarray = None
 
-    def timer_cb(self):
-        self.get_logger().info('Task1 node is alive.', throttle_duration_sec=1)
-        # Feel free to delete this line, and write your algorithm in this callback function
+        self.RRT = RRT(step_size=1.5) # default step size is 4m, TODO: Change according to map size
+        self.frontier_points = []
+        self.s_fixed = 1.0 # fixed distance for frontier point selection
 
+
+    def frontier_explore_timer_cb(self):
+        # Keep finding frontiers
+        if not self.map:
+            self.get_logger().info("Map not available")
+            return
+        if not self.robot_current_position:
+            self.get_logger().info("Robot position not available")
+            return
+        
+        # distance between last process position and current position
+        #s_move = np.sqrt((self.robot_current_position[0] - self.last_process_position[0])**2 + (self.robot_current_position[1] - self.last_process_position[1])**2)
+        #if s_move >= self.s_fixed:
+        #    # Recalculate and reselect optimal frontier point
+        #    # TODO:
+        #    return
+        # Explore frontier
+        iter = 0
+        while iter < 50:
+            #self.get_logger().info("Exploring frontier")
+            # Use real world coord instead of grid coord
+            frontier_point = self.RRT.explore(self.map_data, self.map.info)
+            if frontier_point:
+                self.frontier_points.append(frontier_point)
+                # Reset the RRT tree
+                #self.RRT.insert_node(RRTNode(*self.robot_current_position), None)
+            iter += 1
+        # Publish frontier points and edges
+        rrt_tree = MarkerArray()
+        idx = 0
+        self.get_logger().info(f"num of edges: {len(self.RRT.edges)}")
+        for edge in self.RRT.edges:
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.id = idx
+            marker.ns = "local_frontier_detector"
+            marker.type = Marker.LINE_STRIP
+            marker.action = Marker.ADD
+            marker.scale.x = 0.05
+            marker.color.a = 1.0
+            marker.color.r = 1.0
+            marker.color.g = 0.0
+            marker.color.b = 0.0
+            point = Point()
+            point.x = edge[0].x
+            point.y = edge[0].y
+            marker.points.append(point)
+            point = Point()
+            point.x = edge[1].x
+            point.y = edge[1].y
+            marker.points.append(point)
+            rrt_tree.markers.append(marker)
+            idx += 1
+        self.rrt_pub.publish(rrt_tree)
+
+    def global_frontier_explore_timer_cb(self):
+        # Use image segmentation to find frontiers
+        if not self.map:
+            self.get_logger().info("Map not available")
+            return
+        
+        # Convert map to grayscale with free is white, occupied is black, unknown is gray
+        map_gray = np.zeros_like(self.map_data, dtype=np.uint8)
+        map_gray[self.map_data == CellType.UNKNOWN] = 128  # UNKNOWN -> gray
+        map_gray[self.map_data == CellType.FREE] = 255     # FREE -> white
+        map_gray[self.map_data == CellType.OCCUPIED] = 0   # OCCUPIED -> black
+
+        # Edge detection and create a map of edges
+        blurred_map = cv2.GaussianBlur(map_gray, (3, 3), 0)
+        edges = cv2.Canny(blurred_map, 50, 150)
+        edge_map = (edges == 255).astype(np.uint8)
+
+        # Binarize and dilate the map for obstacles
+        map_binarize_obstacle = (self.map_data == CellType.OCCUPIED).astype(np.uint8)
+        map_binarize_obstacle = cv2.dilate(map_binarize_obstacle, None, iterations=5)
+        # Create free/unknown map by applying bitwise NOT to obstacles
+        map_binarize_free_unknown = 255 - map_binarize_obstacle    
+            
+        # AND operation of edge map and free/unknown map
+        map_frontier = np.bitwise_and(edge_map, map_binarize_free_unknown)
+
+        # Get frontier points
+        frontier_points = np.where(map_frontier != 0)
+        # Publish frontier points
+        frontier_marker_array = MarkerArray()
+        idx = 0
+        for i in range(len(frontier_points[0])):
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.id = idx
+            marker.ns = "global_frontier_detector"
+            marker.type = Marker.POINTS
+            marker.action = Marker.ADD
+            marker.scale.x = 0.1
+            marker.scale.y = 0.1
+            marker.color.a = 1.0
+            marker.color.r = 0.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+            point = Point()
+            point.x, point.y = map_grid_pos_to_real_pos(frontier_points[1][i], frontier_points[0][i], self.map.info.origin, self.map.info.resolution)
+            marker.points.append(point)
+            frontier_marker_array.markers.append(marker)
+            idx += 1
+        self.frontier_pub.publish(frontier_marker_array)
+        
+    
+    def navigation_timer_cb(self):
+        if not self.current_goal:
+            return
+        # TODO:
+        pass
+    
     # Define function(s) that complete the (automatic) mapping task
     def tf_callback(self, tf_msg: TFMessage):
         for stamped_transform in tf_msg.transforms:
@@ -256,60 +345,16 @@ class Task1(Node):
         self.robot_pose_trans = self.odom_trans @ self.robot_base_trans
         #self.get_logger().info(f"Robot pose: {self.robot_pose_trans}")
 
+        if not self.robot_current_position: # initialize last position and RRT
+            self.robot_current_position = (self.robot_pose_trans[0, 3], self.robot_pose_trans[1, 3])
+            self.last_process_position = self.robot_current_position
+            self.RRT.insert_node(RRTNode(*self.robot_current_position), None)
+
     def map_callback(self, grid_map_msg: OccupancyGrid):
-        self.get_logger().info("Map received")        
-        # Get frontier and mark it on the map
-        frontiers = WFDFrontierExtract(grid_map_msg, (self.robot_pose_trans[0, 3], self.robot_pose_trans[1, 3]))
-        self.get_logger().info(f"Frontier count: {len(frontiers)}")
-        marker_array = MarkerArray()
-        marker = Marker()
-        marker.header.frame_id = "map" # Change to your desired frame
-        #marker.ns = "point"
-        marker.id = 1
-        marker.ns = "fontier_points"
-        marker.type = Marker.POINTS
-        marker.action = Marker.ADD
-        # Set properties
-        marker.scale.x = 0.05
-        marker.scale.y = 0.05
-        marker.scale.z = 0.05
-        marker.color.b = 1.0
-        marker.color.a = 1.0
-        marker.header.stamp = self.get_clock().now().to_msg()
-        for frontier in frontiers:
-            for f_point in frontier.points:
-                grid_x, grid_y = f_point
-                x, y = map_grid_pos_to_real_pos(grid_x, grid_y, grid_map_msg.info.origin, grid_map_msg.info.resolution)
-                marker.points.append(Point(x=x, y=y, z=0.0))
-        marker_array.markers.append(marker)
-        marker = Marker()
-        marker.header.frame_id = "map" 
-        marker.id = 2
-        marker.ns = "fontier_centroids"
-        marker.type = Marker.POINTS
-        marker.action = Marker.ADD
-        marker.scale.x = 0.1
-        marker.scale.y = 0.1
-        marker.scale.z = 0.1
-        marker.color.g = 1.0
-        marker.color.a = 1.0
-        for frontier in frontiers:
-            x, y = frontier.centroid
-            x, y = map_grid_pos_to_real_pos(x, y, grid_map_msg.info.origin, grid_map_msg.info.resolution)
-            marker.points.append(Point(x=x, y=y, z=0.0))
-        marker_array.markers.append(marker)
-        self.frontier_pub.publish(marker_array)
-        # Visualize for debugging
-        #map_data = np.array(grid_map_msg.data).reshape((grid_map_msg.info.height, grid_map_msg.info.width))
-        #map_data = np.where(map_data == CellState.UNKNOWN, 128, map_data) # substitute -1 with 128 for unexplored location
-        #map_data = np.where(map_data == CellState.FREE, 255, map_data) # substitute 0 with 255 for free location
-        #map_data = np.where(map_data == CellState.OCCUPIED, 0, map_data) # substitute 1 with 0 for occupied location
-        # Flip y-axis for display from bottom to top (align with rViz and gazebo)
-        #cv2.imshow('Grid map', cv2.flip(
-        #    cv2.resize(map_data.astype(np.uint8),  (grid_map_msg.info.height*3, grid_map_msg.info.width*3), interpolation=cv2.INTER_NEAREST), 
-        #    0)
-        #)
-        #cv2.waitKey(1) # Must exist for imshow to work
+        self.get_logger().info("Map received")
+        self.map = grid_map_msg
+        # Convert map to numpy array
+        self.map_data = np.array(grid_map_msg.data).reshape(grid_map_msg.info.height, grid_map_msg.info.width)
     
 
 def main(args=None):
