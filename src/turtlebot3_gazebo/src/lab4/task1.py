@@ -396,8 +396,6 @@ class Navigator():
             self.path.poses.append(pose)
         # Waypoint reduction
         self.path.poses = waypoint_reduction(self.path.poses, 0.02)
-        print(f'Path length: {len(self.path.poses)}, Distance: {dist}')
-        print(f"All waypoints: {len(raw_path)}, Reduced waypoints: {self.path.poses[0].pose.position.x, self.path.poses[0].pose.position.y, self.path.poses[-1].pose.position.x, self.path.poses[-1].pose.position.y}")
         return True
 
     def path_following(self):
@@ -522,6 +520,22 @@ def check_satisfy_safety_margin(map_data, x, y, radius, target_val):
         return False
     return True
 
+def extract_best_frontier_point(frontier_points, map_data, map_info, current_position):
+    best_score = float('-inf')
+    best_frontier = None
+    for frontier in frontier_points:
+        grid_x_idx, grid_y_idx = real_pose_to_map_grid_pos(frontier[0], frontier[1], map_info.origin, map_info.resolution)
+        # info score is the number of unknown cells within a certain radius r
+        info_score = get_information_score(map_data, grid_x_idx, grid_y_idx, 10, CellType.UNKNOWN)
+        energy_cost = np.sqrt((frontier[0] - current_position[0])**2 + (frontier[1] - current_position[1])**2)
+        c1 = 20.0 if energy_cost > 0.24 else 40.0
+        score = c1 * info_score - 20.0 * energy_cost
+        if score > best_score:
+            best_score = score
+            best_frontier = frontier
+    
+    return best_frontier
+
 class RRTNode():
     def __init__(self, x, y):
         self.x = x
@@ -629,9 +643,10 @@ class Task1(Node):
     """
     def __init__(self):
         super().__init__('task1_node')
-        self.frontier_explore_timer = self.create_timer(0.5, self.frontier_explore_timer_cb)
+        self.frontier_explore_timer = self.create_timer(0.1, self.frontier_explore_timer_cb)
         self.global_frontier_explore_timer = self.create_timer(1, self.global_frontier_explore_timer_cb)
         self.filter_timer = self.create_timer(0.4, self.filter_timer_cb)
+        self.replan_timer = self.create_timer(0.4, self.replan_timer_cb)
         self.task_allocator_timer = self.create_timer(0.2, self.task_allocator_timer_cb)
         # Fill in the initialization member variables that you need
         self.map_subscriber = self.create_subscription(
@@ -661,14 +676,14 @@ class Task1(Node):
         self.map: OccupancyGrid = None
         self.map_data: np.ndarray = None
 
-        self.RRT = RRT(step_size=1.0) # default step size is 4m, TODO: Change according to map size
+        self.RRT = RRT(step_size=2.0) # default step size is 4m, TODO: Change according to map size
         self.local_frontier_points = []
         self.global_frontier_points = []
         self.clustered_frontiers = []
 
         self.state = ExplorationStatus.ROTATING_SCAN
         self.rotate_scan_time = 0.0
-        self.rotate_scan_duration = 3.0
+        self.rotate_scan_duration = 3.5
         self.map_updated = False
 
         self.navigator = Navigator()
@@ -684,7 +699,7 @@ class Task1(Node):
         
         # Explore frontier
         iter = 0
-        while iter < 5:
+        while iter < 2:
             #self.get_logger().info("Exploring frontier")
             # Use real world coord instead of grid coord
             frontier_point = self.RRT.explore(self.map_data, self.map.info)
@@ -841,7 +856,7 @@ class Task1(Node):
         # Filter: Mean shift clustering to find the goal position
         if len(self.global_frontier_points) == 0 and len(self.local_frontier_points) == 0:
             return
-        self.clustered_frontiers = mean_shift_clustering(self.global_frontier_points + self.local_frontier_points, 1.0)
+        self.clustered_frontiers = mean_shift_clustering(self.global_frontier_points + self.local_frontier_points, 0.4)
         self.global_frontier_points = []
         self.local_frontier_points = copy(self.clustered_frontiers) # Store the clustered frontiers as local frontiers
         
@@ -857,6 +872,19 @@ class Task1(Node):
                 ignore_idx.append(idx)
         self.clustered_frontiers = [frontier for idx, frontier in enumerate(self.clustered_frontiers) if idx not in ignore_idx]
 
+    def replan_timer_cb(self):
+        if self.state != ExplorationStatus.NAVIGATE_TO_FRONTIER:
+            return
+        # Check if the current goal is no longer a frontier
+        # Check if the information score of the current goal is still high
+        grid_x_idx, grid_y_idx = real_pose_to_map_grid_pos(self.current_goal[0], self.current_goal[1], self.map.info.origin, self.map.info.resolution)
+        if get_information_score(self.map_data, grid_x_idx, grid_y_idx, 8, CellType.UNKNOWN) < 0.01:
+            #self.get_logger().info("Replan: Current goal is no longer a frontier")
+            self.state = ExplorationStatus.ROTATING_SCAN_DONE
+            self.rotate_scan_time = 0.0
+            self.current_goal = None
+            return
+    
     def task_allocator_timer_cb(self):
         # State routine and transition
         if self.state == ExplorationStatus.ROTATING_SCAN:
@@ -876,19 +904,7 @@ class Task1(Node):
             if len(self.clustered_frontiers) == 0:
                 return
             # Score the frontiers and select the best one
-            best_score = float('-inf')
-            best_frontier = None
-            for clustered_frontier in self.clustered_frontiers:
-                grid_x_idx, grid_y_idx = real_pose_to_map_grid_pos(clustered_frontier[0], clustered_frontier[1], self.map.info.origin, self.map.info.resolution)
-                # info score is the number of unknown cells within a certain radius r
-                info_score = get_information_score(self.map_data, grid_x_idx, grid_y_idx, 10, CellType.UNKNOWN)
-                energy_cost = np.sqrt((clustered_frontier[0] - self.robot_current_position[0])**2 + (clustered_frontier[1] - self.robot_current_position[1])**2)
-                c1 = 20.0 if energy_cost > 0.24 else 40.0
-                score = c1 * info_score - 20.0 * energy_cost
-                if score > best_score:
-                    best_score = score
-                    best_frontier = clustered_frontier
-            self.current_goal = best_frontier
+            self.current_goal = extract_best_frontier_point(self.clustered_frontiers, self.map_data, self.map.info, self.robot_current_position)
 
             #self.navigator.path.header.stamp = self.get_clock().now().to_msg()
             send_goal_result = self.navigator.send_goal(self.robot_current_position, self.current_goal, self.map_data, self.map.info)
@@ -896,7 +912,7 @@ class Task1(Node):
                 # Publish for visualization
                 self.path_pub.publish(self.navigator.path)
 
-            self.get_logger().info(f"Best frontier: {best_frontier}")
+            self.get_logger().info(f"Best frontier: {self.current_goal}")
             marker = Marker()
             marker.header.frame_id = "map"
             marker.header.stamp = self.get_clock().now().to_msg()
