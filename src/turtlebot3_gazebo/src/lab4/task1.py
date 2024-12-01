@@ -211,7 +211,6 @@ class Task1(Node):
         self.robot_pose_trans = np.eye(4) # map (world) frame to robot base frame
 
         self.robot_current_position = None # in real world coord
-        self.last_process_position = None
         self.current_goal = None
         self.map: OccupancyGrid = None
         self.map_data: np.ndarray = None
@@ -231,12 +230,6 @@ class Task1(Node):
             self.get_logger().info("Robot position not available")
             return
         
-        # distance between last process position and current position
-        #s_move = np.sqrt((self.robot_current_position[0] - self.last_process_position[0])**2 + (self.robot_current_position[1] - self.last_process_position[1])**2)
-        #if s_move >= self.s_fixed:
-        #    # Recalculate and reselect optimal frontier point
-        #    # TODO:
-        #    return
         # Explore frontier
         iter = 0
         while iter < 5:
@@ -406,7 +399,6 @@ class Task1(Node):
 
         if not self.robot_current_position: # initialize last position and RRT
             self.robot_current_position = (self.robot_pose_trans[0, 3], self.robot_pose_trans[1, 3])
-            self.last_process_position = self.robot_current_position
             self.RRT.insert_node(RRTNode(*self.robot_current_position), None)
         else:
             self.robot_current_position = (self.robot_pose_trans[0, 3], self.robot_pose_trans[1, 3])
