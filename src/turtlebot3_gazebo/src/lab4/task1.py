@@ -185,7 +185,7 @@ class Task1(Node):
     """
     def __init__(self):
         super().__init__('task1_node')
-        #self.frontier_explore_timer = self.create_timer(0.5, self.frontier_explore_timer_cb)
+        self.frontier_explore_timer = self.create_timer(0.5, self.frontier_explore_timer_cb)
         self.global_frontier_explore_timer = self.create_timer(1, self.global_frontier_explore_timer_cb)
         #self.navigation_timer = self.create_timer(0.2, self.navigation_timer_cb)
         # Fill in the initialization member variables that you need
@@ -243,36 +243,35 @@ class Task1(Node):
             if frontier_point:
                 self.frontier_points.append(frontier_point)
                 # Reset the RRT tree
-                #self.RRT.insert_node(RRTNode(*self.robot_current_position), None)
+                self.RRT.insert_node(RRTNode(*self.robot_current_position), None)
             iter += 1
         # Publish frontier points and edges
-        rrt_tree = MarkerArray()
-        idx = 0
-        self.get_logger().info(f"num of edges: {len(self.RRT.edges)}")
-        for edge in self.RRT.edges:
-            marker = Marker()
-            marker.header.frame_id = "map"
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.id = idx
-            marker.ns = "local_frontier_detector"
-            marker.type = Marker.LINE_STRIP
-            marker.action = Marker.ADD
-            marker.scale.x = 0.05
-            marker.color.a = 1.0
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 0.0
-            point = Point()
-            point.x = edge[0].x
-            point.y = edge[0].y
-            marker.points.append(point)
-            point = Point()
-            point.x = edge[1].x
-            point.y = edge[1].y
-            marker.points.append(point)
-            rrt_tree.markers.append(marker)
-            idx += 1
-        self.rrt_pub.publish(rrt_tree)
+        #rrt_tree = MarkerArray()
+        #idx = 0
+        #for edge in self.RRT.edges:
+        #    marker = Marker()
+        #    marker.header.frame_id = "map"
+        #    marker.header.stamp = self.get_clock().now().to_msg()
+        #    marker.id = idx
+        #    marker.ns = "local_frontier_detector"
+        #    marker.type = Marker.LINE_STRIP
+        #    marker.action = Marker.ADD
+        #    marker.scale.x = 0.05
+        #    marker.color.a = 1.0
+        #    marker.color.r = 1.0
+        #    marker.color.g = 0.0
+        #    marker.color.b = 1.0
+        #    point = Point()
+        #    point.x = edge[0].x
+        #    point.y = edge[0].y
+        #    marker.points.append(point)
+        #    point = Point()
+        #    point.x = edge[1].x
+        #    point.y = edge[1].y
+        #    marker.points.append(point)
+        #    rrt_tree.markers.append(marker)
+        #    idx += 1
+        #self.rrt_pub.publish(rrt_tree)
 
     def global_frontier_explore_timer_cb(self):
         # Use image segmentation to find frontiers
@@ -296,16 +295,42 @@ class Task1(Node):
         map_binarize_obstacle = cv2.dilate(map_binarize_obstacle, None, iterations=5)
         # Create free/unknown map by applying bitwise NOT to obstacles
         map_binarize_free_unknown = 255 - map_binarize_obstacle    
-            
+
         # AND operation of edge map and free/unknown map
         map_frontier = np.bitwise_and(edge_map, map_binarize_free_unknown)
 
-        # Get frontier points
-        frontier_points = np.where(map_frontier != 0)
+        # Find contour and extract midpoints of edges as frontier points
+        contours, _ = cv2.findContours(map_frontier, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        frontier_points = []
+        for contour in contours:
+            M = cv2.moments(contour)
+            #self.get_logger().info(f"Contour area: {cv2.contourArea(contour)}, {M['m00']}, points in contour {len(contour)}")
+            if M["m00"] != 0: # avoid division by zero
+                cX = int(M["m10"] / M["m00"])
+                cY = int(M["m01"] / M["m00"])
+                #self.get_logger().info(f"Contour center: {cX}, {cY}")
+                frontier_points.append((cX, cY))
+            elif len(contour) > 3: # handle thin line edge and ignore small contour
+                # Use the mean point of the contour
+                cX = int(np.mean(contour[:, 0, 0]))
+                cY = int(np.mean(contour[:, 0, 1]))
+                #self.get_logger().info(f"Contour center: {cX}, {cY}")
+                frontier_points.append((cX, cY))
+
         # Publish frontier points
         frontier_marker_array = MarkerArray()
         idx = 0
-        for i in range(len(frontier_points[0])):
+        # clear previous markers
+        frontier_marker_array.markers = []
+        clear_all_markers = Marker()
+        clear_all_markers.action = Marker.DELETEALL
+        clear_all_markers.ns = "global_frontier_detector"
+        clear_all_markers.header.frame_id = "map"
+        clear_all_markers.header.stamp = self.get_clock().now().to_msg()
+        frontier_marker_array.markers.append(clear_all_markers)
+        self.frontier_pub.publish(frontier_marker_array)
+        frontier_marker_array.markers = []
+        for i in range(len(frontier_points)):
             marker = Marker()
             marker.header.frame_id = "map"
             marker.header.stamp = self.get_clock().now().to_msg()
@@ -320,11 +345,35 @@ class Task1(Node):
             marker.color.g = 1.0
             marker.color.b = 0.0
             point = Point()
-            point.x, point.y = map_grid_pos_to_real_pos(frontier_points[1][i], frontier_points[0][i], self.map.info.origin, self.map.info.resolution)
+            point.x, point.y = map_grid_pos_to_real_pos(frontier_points[i][0], frontier_points[i][1], self.map.info.origin, self.map.info.resolution)
             marker.points.append(point)
             frontier_marker_array.markers.append(marker)
             idx += 1
         self.frontier_pub.publish(frontier_marker_array)
+
+        # Publish local frontier points
+        rrt_tree = MarkerArray()
+        idx = 0
+        for frontier_point in self.frontier_points:
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.id = idx
+            marker.ns = "local_frontier_detector"
+            marker.type = Marker.POINTS
+            marker.action = Marker.ADD
+            marker.scale.x = 0.1
+            marker.scale.y = 0.1
+            marker.color.a = 1.0
+            marker.color.r = 1.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+            point = Point()
+            point.x, point.y = frontier_point[0], frontier_point[1]
+            marker.points.append(point)
+            rrt_tree.markers.append(marker)
+            idx += 1
+        self.rrt_pub.publish(rrt_tree)
         
     
     def navigation_timer_cb(self):
