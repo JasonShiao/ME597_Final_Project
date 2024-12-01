@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from geometry_msgs.msg import Pose
 from geometry_msgs.msg import Transform
-import queue
+from geometry_msgs.msg import PoseStamped, Twist
 from enum import IntEnum
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
@@ -57,6 +57,11 @@ class CellType(IntEnum):
     FREE = 0
     OCCUPIED = 100
 
+class ExplorationStatus(IntEnum):
+    ROTATING_SCAN = 0
+    ROTATING_SCAN_DONE = 1
+    NAVIGATE_TO_FRONTIER = 2
+
 
 def map_grid_pos_to_real_pos(grid_x_idx, grid_y_idx, origin: Pose, resolution):
     # real x, y in grid origin coordinate
@@ -79,6 +84,44 @@ def real_pose_to_map_grid_pos(real_x, real_y, origin: Pose, resolution, closest=
         grid_x_idx = np.floor(pos[0] / resolution)
         grid_y_idx = np.floor(pos[0] / resolution)
     return grid_x_idx, grid_y_idx
+
+def mean_shift_clustering(points, bandwidth, max_iteration=200, tolerance=5e-3):
+    n_points = len(points)
+    points = np.array(points)
+    cluster_centers = points.copy()
+
+    for iteration in range(max_iteration):
+        new_centers = np.zeros_like(cluster_centers)
+        for i, center in enumerate(cluster_centers):
+            distances = np.linalg.norm(points - center, axis=1)
+            in_bandwidth = points[distances <= bandwidth]
+            new_centers[i] = np.mean(in_bandwidth, axis=0)
+        shift = np.linalg.norm(new_centers - cluster_centers, axis=1)
+        if np.max(shift) < tolerance:
+            break
+
+        cluster_centers = new_centers
+    
+    unique_cluster_centers = np.unique(cluster_centers, axis=0)
+    # Convert to a list of tuple
+    unique_cluster_centers = [tuple(center) for center in unique_cluster_centers]
+    return unique_cluster_centers
+
+
+def count_pixels_with_value_around_point(map_data, x, y, radius, target_val):
+    # Get bounding square around the point first
+    x_range = np.arange(x - radius, x + radius + 1)
+    y_range = np.arange(y - radius, y + radius + 1)
+    x_range = x_range[(x_range >= 0) & (x_range < map_data.shape[1])]
+    y_range = y_range[(y_range >= 0) & (y_range < map_data.shape[0])]
+    x_idx, y_idx = np.meshgrid(x_range, y_range)
+    x_idx = x_idx.flatten()
+    y_idx = y_idx.flatten()
+    # Restrict to circle
+    dist_squared = (x_idx - x) ** 2 + (y_idx - y) ** 2
+    circle_mask = dist_squared <= radius ** 2
+    count = np.sum((map_data[y_idx[circle_mask], x_idx[circle_mask]] == target_val))
+    return count
 
 class RRTNode():
     def __init__(self, x, y):
@@ -189,7 +232,7 @@ class Task1(Node):
         super().__init__('task1_node')
         self.frontier_explore_timer = self.create_timer(0.5, self.frontier_explore_timer_cb)
         self.global_frontier_explore_timer = self.create_timer(1, self.global_frontier_explore_timer_cb)
-        #self.navigation_timer = self.create_timer(0.2, self.navigation_timer_cb)
+        self.task_allocator_timer = self.create_timer(0.2, self.task_allocator_timer_cb)
         # Fill in the initialization member variables that you need
         self.map_subscriber = self.create_subscription(
             OccupancyGrid,
@@ -205,6 +248,7 @@ class Task1(Node):
         )
         self.frontier_pub = self.create_publisher(MarkerArray, '/frontier', 3)
         self.rrt_pub = self.create_publisher(MarkerArray, '/rrt', 3)
+        self.vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
         self.odom_trans = np.eye(4)       # map (world) frame to odom frame
         self.robot_base_trans = np.eye(4) # odom frame to robot base frame
@@ -218,8 +262,10 @@ class Task1(Node):
         self.RRT = RRT(step_size=1.0) # default step size is 4m, TODO: Change according to map size
         self.local_frontier_points = []
         self.global_frontier_points = []
-        self.s_fixed = 1.0 # fixed distance for frontier point selection
 
+        self.state = ExplorationStatus.ROTATING_SCAN
+        self.rotate_scan_time = 0.0
+        self.rotate_scan_duration = 3.0
 
     def frontier_explore_timer_cb(self):
         # Keep finding frontiers
@@ -338,13 +384,13 @@ class Task1(Node):
                 cX = int(M["m10"] / M["m00"])
                 cY = int(M["m01"] / M["m00"])
                 #self.get_logger().info(f"Contour center: {cX}, {cY}")
-                self.global_frontier_points.append((cX, cY))
+                self.global_frontier_points.append(map_grid_pos_to_real_pos(cX, cY, self.map.info.origin, self.map.info.resolution))
             elif len(contour) > 3: # handle thin line edge and ignore small contour
                 # Use the mean point of the contour
                 cX = int(np.mean(contour[:, 0, 0]))
                 cY = int(np.mean(contour[:, 0, 1]))
                 #self.get_logger().info(f"Contour center: {cX}, {cY}")
-                self.global_frontier_points.append((cX, cY))
+                self.global_frontier_points.append(map_grid_pos_to_real_pos(cX, cY, self.map.info.origin, self.map.info.resolution))
 
         # Publish frontier points
         frontier_marker_array = MarkerArray()
@@ -373,17 +419,64 @@ class Task1(Node):
             marker.color.g = 1.0
             marker.color.b = 0.0
             point = Point()
-            point.x, point.y = map_grid_pos_to_real_pos(frontier_point[0], frontier_point[1], self.map.info.origin, self.map.info.resolution)
+            point.x, point.y = frontier_point[0], frontier_point[1]
             marker.points.append(point)
             frontier_marker_array.markers.append(marker)
             idx += 1
         self.frontier_pub.publish(frontier_marker_array)        
     
-    def navigation_timer_cb(self):
-        if not self.current_goal:
+    def task_allocator_timer_cb(self):
+        # Remove invalid frontier (no longer a frontier), check the map value is still unexplored
+        self.local_frontier_points = [frontier for frontier in self.local_frontier_points if self.map_data[real_pose_to_map_grid_pos(frontier[0], frontier[1], self.map.info.origin, self.map.info.resolution)[::-1]] == CellType.UNKNOWN]
+        #self.global_frontier_points = [frontier for frontier in self.global_frontier_points if self.map_data[real_pose_to_map_grid_pos(frontier[0], frontier[1], self.map.info.origin, self.map.info.resolution)[::-1]] == CellType.UNKNOWN]
+
+        # Filter: Mean shift clustering to find the goal position
+        if len(self.global_frontier_points) == 0 and len(self.local_frontier_points) == 0:
             return
-        # TODO:
-        pass
+        clustered_frontiers = mean_shift_clustering(self.global_frontier_points + self.local_frontier_points, 1.0, max_iteration=200, tolerance=5e-3)
+
+        # State routine and transition
+        if self.state == ExplorationStatus.ROTATING_SCAN:
+            if self.rotate_scan_time >= self.rotate_scan_duration:
+                self.state = ExplorationStatus.ROTATING_SCAN_DONE
+                self.rotate_scan_time = 0.0
+                self.get_logger().info("Rotating scan done")
+            else:
+                self.rotate_scan_time += 0.2
+                rotate_cmd = Twist()
+                rotate_cmd.angular.z = 0.8
+                self.vel_pub.publish(rotate_cmd)
+        elif self.state == ExplorationStatus.ROTATING_SCAN_DONE:
+            if len(clustered_frontiers) == 0:
+                return
+            # Score the frontiers and select the best one
+            best_score = float('-inf')
+            best_frontier = None
+            for clustered_frontier in clustered_frontiers:
+                grid_x_idx, grid_y_idx = real_pose_to_map_grid_pos(clustered_frontier[0], clustered_frontier[1], self.map.info.origin, self.map.info.resolution)
+                # info score is the number of unknown cells within a certain radius r
+                info_score = count_pixels_with_value_around_point(self.map_data, grid_x_idx, grid_y_idx, 10, CellType.UNKNOWN)
+                energy_cost = np.sqrt((clustered_frontier[0] - self.robot_current_position[0])**2 + (clustered_frontier[1] - self.robot_current_position[1])**2)
+                c1 = 1.0 if energy_cost > 0.24 else 2.0
+                score = c1 * info_score - 1.0 * energy_cost
+                if score > best_score:
+                    best_score = score
+                    best_frontier = clustered_frontier
+            self.current_goal = best_frontier
+            self.get_logger().info(f"Best frontier: {best_frontier}")
+            self.state = ExplorationStatus.NAVIGATE_TO_FRONTIER
+        elif self.state == ExplorationStatus.NAVIGATE_TO_FRONTIER:
+            # Navigate to the goal
+            # TODO: Check if the goal is reached
+            if np.sqrt((self.robot_current_position[0] - self.current_goal[0])**2 + (self.robot_current_position[1] - self.current_goal[1])**2) < 0.07:
+                self.get_logger().info("Goal reached")
+                self.state = ExplorationStatus.ROTATING_SCAN
+                self.rotate_scan_time = 0.0
+                self.current_goal = None
+            # TODO: Select the best frontier as above
+            pass
+        else:
+            self.get_logger().info("Invalid state")
     
     # Define function(s) that complete the (automatic) mapping task
     def tf_callback(self, tf_msg: TFMessage):
