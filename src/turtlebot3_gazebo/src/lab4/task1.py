@@ -2,7 +2,7 @@
 
 import rclpy
 from rclpy.node import Node
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 from tf2_msgs.msg import TFMessage
 
 import cv2
@@ -13,7 +13,398 @@ from geometry_msgs.msg import PoseStamped, Twist
 from enum import IntEnum
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
-from scipy.ndimage import binary_dilation
+from sklearn.cluster import MeanShift
+from copy import copy
+
+
+# ===================== Map Processor ========================
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+from graphviz import Graph
+from nav_msgs.msg import MapMetaData
+class TreeNode():
+    def __init__(self,name):
+        self.name = name
+        self.children = []
+        self.weight = []
+
+    def __repr__(self):
+        return self.name
+
+    def add_children(self,node,w=None):
+        if w == None:
+            w = [1]*len(node)
+        self.children.extend(node)
+        self.weight.extend(w)
+
+class Tree():
+    def __init__(self):
+        self.root = 0
+        self.end = 0
+        self.g = {}
+        self.g_visual = Graph('G')
+
+    def __call__(self):
+        for name,node in self.g.items():
+            if(self.root == name):
+                self.g_visual.node(name,name,color='red')
+            elif(self.end == name):
+                self.g_visual.node(name,name,color='blue')
+            else:
+                self.g_visual.node(name,name)
+            # Connect to all direct children from the current node
+            for i in range(len(node.children)):
+                c = node.children[i]
+                w = node.weight[i]
+                #print('%s -> %s'%(name,c.name))
+                if w == 0:
+                    self.g_visual.edge(name,c.name)
+                else:
+                    self.g_visual.edge(name,c.name,label=str(w))
+        return self.g_visual
+
+    def add_node(self, node, start = False, end = False):
+        self.g[node.name] = node
+        if start:
+            self.root = node.name
+        elif end:
+            self.end = node.name
+
+    def set_as_root(self,node):
+        # These are exclusive conditions
+        self.root = True
+        self.end = False
+
+    def set_as_end(self,node):
+        # These are exclusive conditions
+        self.root = False
+        self.end = True
+
+
+class Map():
+    def __init__(self, map_data, map_info: MapMetaData):
+        self.map_im = map_data
+        self.map_info = map_info
+        self.limits = [map_info.origin.position.x, map_info.origin.position.x + map_info.width * map_info.resolution, map_info.origin.position.y, map_info.origin.position.y + map_info.height * map_info.resolution]
+        self.image_array = self.__get_obstacle_map(self.map_im)
+
+    def __repr__(self):
+        fig, ax = plt.subplots(dpi=150)
+        ax.imshow(self.image_array,extent=self.limits, cmap=cm.gray)
+        ax.plot()
+        return ""
+
+    def __get_obstacle_map(self, map_im):
+        img_array = np.zeros_like(map_im, dtype=np.uint8)
+        img_array[map_im == 100] = 255   # OCCUPIED -> black
+        return img_array
+    
+    def get_real_world_pos(self, y_pixel_idx, x_pixel_idx):
+        # Note: the pixel is in (y,x) and y-axis from top to bottom
+        return self.limits[0] + x_pixel_idx * self.map_info.resolution, self.limits[2] + y_pixel_idx * self.map_info.resolution
+
+    def get_closest_pixel(self, x_pos, y_pos):
+        # Note: the pixel is in (y,x) and y-axis from top to bottom
+        return round((y_pos - self.limits[2]) / self.map_info.resolution), round((x_pos - self.limits[0]) / self.map_info.resolution)
+
+class MapProcessor():
+    def __init__(self, map_data, map_info: MapMetaData):
+        self.map = Map(map_data, map_info)
+        self.inf_map_img_array = np.zeros(self.map.image_array.shape)
+        self.map_graph = Tree()
+
+        # Change these initialization if needed
+        kr = self.rect_kernel(9,1) # Inflate a safety margin for turtlebot ( > 0.2m / 0.05)
+        self.inflate_map(kr,True)
+        self.get_graph_from_map()
+
+    def __modify_map_pixel(self,map_array,i,j,value,absolute):
+        if( (i >= 0) and
+            (i < map_array.shape[0]) and
+            (j >= 0) and
+            (j < map_array.shape[1]) ):
+            if absolute:
+                map_array[i][j] = value
+            else:
+                map_array[i][j] += value
+
+    def __inflate_obstacle(self,kernel,map_array,i,j,absolute):
+        dx = int(kernel.shape[0]//2)
+        dy = int(kernel.shape[1]//2)
+        if (dx == 0) and (dy == 0):
+            self.__modify_map_pixel(map_array,i,j,kernel[0][0],absolute)
+        else:
+            for k in range(i-dx,i+dx):
+                for l in range(j-dy,j+dy):
+                    self.__modify_map_pixel(map_array,k,l,kernel[k-i+dx][l-j+dy],absolute)
+
+    def inflate_map(self,kernel,absolute=True):
+        # Perform an operation like dilation, such that the small wall found during the mapping process
+        # are increased in size, thus forcing a safer path.
+        self.inf_map_img_array = np.zeros(self.map.image_array.shape)
+        for i in range(self.map.image_array.shape[0]):
+            for j in range(self.map.image_array.shape[1]):
+                if self.map.image_array[i][j] == 255:
+                    self.__inflate_obstacle(kernel,self.inf_map_img_array,i,j,absolute)
+        r = np.max(self.inf_map_img_array)-np.min(self.inf_map_img_array)
+        if r == 0:
+            r = 1
+        self.inf_map_img_array = (self.inf_map_img_array - np.min(self.inf_map_img_array))/r
+
+    def get_graph_from_map(self):
+        # Create the nodes that will be part of the graph, considering only valid nodes or the free space
+        for i in range(self.map.image_array.shape[0]):
+            for j in range(self.map.image_array.shape[1]):
+                if self.inf_map_img_array[i][j] == 0:
+                    node = TreeNode('%d,%d'%(i,j))
+                    self.map_graph.add_node(node)
+        # Connect the nodes through edges
+        for i in range(self.map.image_array.shape[0]): # y, from up to down
+            for j in range(self.map.image_array.shape[1]): # x, from left to right
+                if self.inf_map_img_array[i][j] == 0:
+                    if (i > 0):
+                        if self.inf_map_img_array[i-1][j] == 0:
+                            # add an edge up
+                            child_up = self.map_graph.g['%d,%d'%(i-1,j)]
+                            self.map_graph.g['%d,%d'%(i,j)].add_children([child_up],[1])
+                    if (i < (self.map.image_array.shape[0] - 1)):
+                        if self.inf_map_img_array[i+1][j] == 0:
+                            # add an edge down
+                            child_dw = self.map_graph.g['%d,%d'%(i+1,j)]
+                            self.map_graph.g['%d,%d'%(i,j)].add_children([child_dw],[1])
+                    if (j > 0):
+                        if self.inf_map_img_array[i][j-1] == 0:
+                            # add an edge to the left
+                            child_lf = self.map_graph.g['%d,%d'%(i,j-1)]
+                            self.map_graph.g['%d,%d'%(i,j)].add_children([child_lf],[1])
+                    if (j < (self.map.image_array.shape[1] - 1)):
+                        if self.inf_map_img_array[i][j+1] == 0:
+                            # add an edge to the right
+                            child_rg = self.map_graph.g['%d,%d'%(i,j+1)]
+                            self.map_graph.g['%d,%d'%(i,j)].add_children([child_rg],[1])
+                    if ((i > 0) and (j > 0)):
+                        if self.inf_map_img_array[i-1][j-1] == 0:
+                            # add an edge up-left
+                            child_up_lf = self.map_graph.g['%d,%d'%(i-1,j-1)]
+                            self.map_graph.g['%d,%d'%(i,j)].add_children([child_up_lf],[np.sqrt(2)])
+                    if ((i > 0) and (j < (self.map.image_array.shape[1] - 1))):
+                        if self.inf_map_img_array[i-1][j+1] == 0:
+                            # add an edge up-right
+                            child_up_rg = self.map_graph.g['%d,%d'%(i-1,j+1)]
+                            self.map_graph.g['%d,%d'%(i,j)].add_children([child_up_rg],[np.sqrt(2)])
+                    if ((i < (self.map.image_array.shape[0] - 1)) and (j > 0)):
+                        if self.inf_map_img_array[i+1][j-1] == 0:
+                            # add an edge down-left
+                            child_dw_lf = self.map_graph.g['%d,%d'%(i+1,j-1)]
+                            self.map_graph.g['%d,%d'%(i,j)].add_children([child_dw_lf],[np.sqrt(2)])
+                    if ((i < (self.map.image_array.shape[0] - 1)) and (j < (self.map.image_array.shape[1] - 1))):
+                        if self.inf_map_img_array[i+1][j+1] == 0:
+                            # add an edge down-right
+                            child_dw_rg = self.map_graph.g['%d,%d'%(i+1,j+1)]
+                            self.map_graph.g['%d,%d'%(i,j)].add_children([child_dw_rg],[np.sqrt(2)])
+
+    def gaussian_kernel(self, size, sigma=1):
+        size = int(size) // 2
+        x, y = np.mgrid[-size:size+1, -size:size+1]
+        normal = 1 / (2.0 * np.pi * sigma**2)
+        g =  np.exp(-((x**2 + y**2) / (2.0*sigma**2))) * normal
+        r = np.max(g)-np.min(g)
+        sm = (g - np.min(g))*1/r
+        return sm
+
+    def rect_kernel(self, size, value):
+        m = np.ones(shape=(size,size))
+        return m
+
+# ============================== Path Planner ================================
+class AStar():
+    def __init__(self,in_tree: Tree):
+        self.in_tree: Tree = in_tree
+        self.open_nodes = {} # key: node name, value: (priority, node)
+        #self.q = PriorityQueue()
+        self.dist = {} # g: cost so far (from start)
+        self.h = {} # h: cost to goal
+        self.via = {name:0 for name,node in in_tree.g.items()}
+        self.processed_nodes = set() # set of node names those shortest path have been determined
+
+    def __get_f_score(self,node):
+        # f = g + h
+        return self.dist[node.name] + self.h[node.name]
+
+    def solve(self, start_node: TreeNode, end_node: TreeNode, visualize = False) -> bool:
+        # Clean up for each solution
+        self.open_nodes = {}
+        self.dist = {}
+        self.h = {}
+        self.processed_nodes = set()
+
+        # Calculate h value for each node
+        for name, node in self.in_tree.g.items():
+            start = tuple(map(int, name.split(',')))
+            goal = tuple(map(int, end_node.name.split(',')))
+            # With h, we add a tendency/force (heuristic) to the end position
+            self.h[name] = np.sqrt((goal[0]-start[0])**2 + (goal[1]-start[1])**2)
+
+        self.via = {name:0 for name,node in self.in_tree.g.items()}
+        # Set dist (g) for starting node
+        self.dist[start_node.name] = 0
+        self.open_nodes[start_node.name] = (self.__get_f_score(start_node), start_node)
+
+        if visualize:
+            plot_x_pos = []
+            plot_y_pos = []
+            plot_f_val = []
+        
+        solved = False
+        while len(self.open_nodes) > 0:
+            min_node_name = min(self.open_nodes, key=lambda k: self.open_nodes[k][0])
+            priority, current_node = self.open_nodes[min_node_name]
+            del self.open_nodes[min_node_name]
+
+            # Skip if the node has been processed
+            if current_node.name in self.processed_nodes:
+                continue
+            self.processed_nodes.add(current_node.name)
+
+            #print(f"priority: {priority}, node: {current_node.name}")
+            if visualize:
+                plot_x_pos.append(tuple(map(int, current_node.name.split(',')))[1])
+                plot_y_pos.append(tuple(map(int, current_node.name.split(',')))[0])
+                plot_f_val.append(priority)
+            
+            if current_node.name == end_node.name:
+                solved = True
+                break
+            for i in range(len(current_node.children)):
+                child = current_node.children[i]
+                w = current_node.weight[i] # distance from current node to child node
+                new_dist = self.dist[current_node.name] + w
+                # NOTE: use dist INSTEAD OF priority to determine whether we should update child node
+                if child.name not in self.processed_nodes and (child.name not in self.dist or new_dist < self.dist[child.name]):
+                    self.dist[child.name] = new_dist
+                    self.via[child.name] = current_node.name
+                    self.open_nodes[child.name] = (self.__get_f_score(child), child)
+        
+        # Plot for debug
+        if visualize:
+            grid_size_x = max(plot_x_pos)+1
+            grid_size_y = max(plot_y_pos)+1
+            grid = np.full((grid_size_y, grid_size_x), np.nan)
+            for xi, yi, vi in zip(plot_x_pos, plot_y_pos, plot_f_val):
+                grid[yi,xi] = vi
+            plt.figure()
+            plt.pcolormesh(grid, cmap='viridis', shading='auto')
+            plt.gca().invert_yaxis()
+            plt.colorbar(label='value')
+            plt.show()
+        
+        return solved
+    
+
+    def reconstruct_path(self,sn,en):
+        path = []
+        dist = 0
+        # Place code here
+        current_node_key = self.via[en.name]
+        path.append(en.name)
+        dist = self.dist[en.name]
+        while current_node_key != sn.name:
+            path.append(current_node_key)
+            current_node_key = self.via[current_node_key]
+        path.append(sn.name)
+        path.reverse()
+        return path, dist
+
+# ================================ Navigator =================================
+def waypoint_reduction(path_poses: list, epsilon):
+    # Douglas-Peucker algorithm
+    # Recurssion
+
+    if len(path_poses) <= 2:
+        return path_poses
+    
+    start = path_poses[0].pose.position
+    end = path_poses[-1].pose.position
+    max_dist = 0
+    max_idx = -1
+    for i in range(1, len(path_poses)-1):
+        numerator = abs((end.y - start.y) * path_poses[i].pose.position.x - (end.x - start.x) * path_poses[i].pose.position.y + end.x * start.y - end.y * start.x)
+        denominator = np.sqrt((end.y - start.y)**2 + (end.x - start.x)**2)
+        dist = numerator / denominator
+        if dist > max_dist:
+            max_dist = dist
+            max_idx = i
+    
+    if max_dist < epsilon: # All fall close to the line, remove all middle points
+        return [path_poses[0], path_poses[-1]]
+    
+    # Divide at max idx
+    path_poses_1 = waypoint_reduction(path_poses[:max_idx+1], epsilon)
+    path_poses_2 = waypoint_reduction(path_poses[max_idx+1:], epsilon)
+    merge = path_poses_1[:-1] + path_poses_2
+    return merge
+
+class Navigator():
+    def __init__(self):
+        self.current_goal_ = None
+        self.map_processor_ = None
+        self.path = Path() # path with waypoints
+        self.path.header.frame_id = 'map'
+    
+    def send_goal(self, current_pos, goal, map_data, map_info):
+        # if too close, don't change goal
+        if self.current_goal_ and ((self.current_goal_[0] - goal[0])**2 + (self.current_goal_[1] - goal[1])**2) < 0.05**2:
+            return False
+        self.current_goal_ = goal
+        # Initialize map processor
+        self.map_processor_ = MapProcessor(map_data, map_info)
+        # Visualize for debug
+        #import matplotlib.pyplot as plt
+        #fig, ax = plt.subplots(dpi=100)
+        #plt.imshow(self.map_processor_.inf_map_img_array)
+        #plt.colorbar()
+        #plt.pause(0.5)
+        #plt.show(block=False)
+
+        # A* Path planning
+        a_star_planner = AStar(self.map_processor_.map_graph)
+        self.path.poses = []
+        start_y_idx, start_x_idx = self.map_processor_.map.get_closest_pixel(current_pos[0], current_pos[1])
+        end_y_idx, end_x_idx = self.map_processor_.map.get_closest_pixel(goal[0], goal[1])
+        if (f'{start_y_idx},{start_x_idx}' not in self.map_processor_.map_graph.g) or (f'{end_y_idx},{end_x_idx}' not in self.map_processor_.map_graph.g):
+            if (f'{start_y_idx},{start_x_idx}' not in self.map_processor_.map_graph.g):
+                pass
+            if (f'{end_y_idx},{end_x_idx}' not in self.map_processor_.map_graph.g):
+                pass
+            return False
+        
+        solved = a_star_planner.solve(self.map_processor_.map_graph.g[f'{start_y_idx},{start_x_idx}'], self.map_processor_.map_graph.g[f'{end_y_idx},{end_x_idx}'], visualize=False)
+        if not solved:
+            #pass
+            return False
+        
+        #print(planner.dist)
+        raw_path, dist = a_star_planner.reconstruct_path(self.map_processor_.map_graph.g[f'{start_y_idx},{start_x_idx}'], self.map_processor_.map_graph.g[f'{end_y_idx},{end_x_idx}'])
+        for node in raw_path:
+            y_pixel_idx, x_pixel_idx = map(int, node.split(','))
+            x_real_pos, y_real_pos = self.map_processor_.map.get_real_world_pos(y_pixel_idx, x_pixel_idx)
+            pose = PoseStamped()
+            pose.header.frame_id = self.path.header.frame_id
+            pose.header.stamp = self.path.header.stamp
+            pose.pose.position.x = x_real_pos
+            pose.pose.position.y = y_real_pos
+            self.path.poses.append(pose)
+        # Waypoint reduction
+        self.path.poses = waypoint_reduction(self.path.poses, 0.02)
+        print(f'Path length: {len(self.path.poses)}, Distance: {dist}')
+        print(f"All waypoints: {len(raw_path)}, Reduced waypoints: {self.path.poses[0].pose.position.x, self.path.poses[0].pose.position.y, self.path.poses[-1].pose.position.x, self.path.poses[-1].pose.position.y}")
+        return True
+
+    def path_following(self):
+        # MPC controller
+        # return Twist msg for cmd_vel or None if goal reached
+        pass
+
 
 # Import other python packages that you think necessary
 def getPoseTransSE3(pose: Pose):
@@ -85,30 +476,20 @@ def real_pose_to_map_grid_pos(real_x, real_y, origin: Pose, resolution, closest=
         grid_y_idx = np.floor(pos[0] / resolution)
     return grid_x_idx, grid_y_idx
 
-def mean_shift_clustering(points, bandwidth, max_iteration=200, tolerance=5e-3):
-    n_points = len(points)
-    points = np.array(points)
-    cluster_centers = points.copy()
-
-    for iteration in range(max_iteration):
-        new_centers = np.zeros_like(cluster_centers)
-        for i, center in enumerate(cluster_centers):
-            distances = np.linalg.norm(points - center, axis=1)
-            in_bandwidth = points[distances <= bandwidth]
-            new_centers[i] = np.mean(in_bandwidth, axis=0)
-        shift = np.linalg.norm(new_centers - cluster_centers, axis=1)
-        if np.max(shift) < tolerance:
-            break
-
-        cluster_centers = new_centers
-    
-    unique_cluster_centers = np.unique(cluster_centers, axis=0)
-    # Convert to a list of tuple
-    unique_cluster_centers = [tuple(center) for center in unique_cluster_centers]
-    return unique_cluster_centers
+def mean_shift_clustering(points, bandwidth):
+    centroids = []
+    if len(points) > 3:
+        ms = MeanShift(bandwidth=bandwidth, bin_seeding=True)
+        ms.fit(points)
+        centroids = ms.cluster_centers_
+        centroids = [tuple(center) for center in centroids]
+    else:
+        centroids = points
+        
+    return centroids
 
 
-def count_pixels_with_value_around_point(map_data, x, y, radius, target_val):
+def get_information_score(map_data, x, y, radius, target_val):
     # Get bounding square around the point first
     x_range = np.arange(x - radius, x + radius + 1)
     y_range = np.arange(y - radius, y + radius + 1)
@@ -121,7 +502,25 @@ def count_pixels_with_value_around_point(map_data, x, y, radius, target_val):
     dist_squared = (x_idx - x) ** 2 + (y_idx - y) ** 2
     circle_mask = dist_squared <= radius ** 2
     count = np.sum((map_data[y_idx[circle_mask], x_idx[circle_mask]] == target_val))
-    return count
+    # score: ratio of unknown cells in the circle
+    return count / np.sum(circle_mask)
+
+def check_satisfy_safety_margin(map_data, x, y, radius, target_val):
+    # Get bounding square around the point first
+    x_range = np.arange(x - radius, x + radius + 1)
+    y_range = np.arange(y - radius, y + radius + 1)
+    x_range = x_range[(x_range >= 0) & (x_range < map_data.shape[1])]
+    y_range = y_range[(y_range >= 0) & (y_range < map_data.shape[0])]
+    x_idx, y_idx = np.meshgrid(x_range, y_range)
+    x_idx = x_idx.flatten()
+    y_idx = y_idx.flatten()
+    # Restrict to circle
+    dist_squared = (x_idx - x) ** 2 + (y_idx - y) ** 2
+    circle_mask = dist_squared <= radius ** 2
+    count = np.sum((map_data[y_idx[circle_mask], x_idx[circle_mask]] == target_val))
+    if count > 0:
+        return False
+    return True
 
 class RRTNode():
     def __init__(self, x, y):
@@ -232,6 +631,7 @@ class Task1(Node):
         super().__init__('task1_node')
         self.frontier_explore_timer = self.create_timer(0.5, self.frontier_explore_timer_cb)
         self.global_frontier_explore_timer = self.create_timer(1, self.global_frontier_explore_timer_cb)
+        self.filter_timer = self.create_timer(0.4, self.filter_timer_cb)
         self.task_allocator_timer = self.create_timer(0.2, self.task_allocator_timer_cb)
         # Fill in the initialization member variables that you need
         self.map_subscriber = self.create_subscription(
@@ -249,6 +649,8 @@ class Task1(Node):
         self.frontier_pub = self.create_publisher(MarkerArray, '/frontier', 3)
         self.rrt_pub = self.create_publisher(MarkerArray, '/rrt', 3)
         self.vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.goal_pub = self.create_publisher(Marker, '/goal', 10)
+        self.path_pub = self.create_publisher(Path, '/waypoint_path', 10)
 
         self.odom_trans = np.eye(4)       # map (world) frame to odom frame
         self.robot_base_trans = np.eye(4) # odom frame to robot base frame
@@ -262,10 +664,14 @@ class Task1(Node):
         self.RRT = RRT(step_size=1.0) # default step size is 4m, TODO: Change according to map size
         self.local_frontier_points = []
         self.global_frontier_points = []
+        self.clustered_frontiers = []
 
         self.state = ExplorationStatus.ROTATING_SCAN
         self.rotate_scan_time = 0.0
         self.rotate_scan_duration = 3.0
+        self.map_updated = False
+
+        self.navigator = Navigator()
 
     def frontier_explore_timer_cb(self):
         # Keep finding frontiers
@@ -423,9 +829,11 @@ class Task1(Node):
             marker.points.append(point)
             frontier_marker_array.markers.append(marker)
             idx += 1
-        self.frontier_pub.publish(frontier_marker_array)        
+        self.frontier_pub.publish(frontier_marker_array)
+
+        self.map_updated = True
     
-    def task_allocator_timer_cb(self):
+    def filter_timer_cb(self):
         # Remove invalid frontier (no longer a frontier), check the map value is still unexplored
         self.local_frontier_points = [frontier for frontier in self.local_frontier_points if self.map_data[real_pose_to_map_grid_pos(frontier[0], frontier[1], self.map.info.origin, self.map.info.resolution)[::-1]] == CellType.UNKNOWN]
         #self.global_frontier_points = [frontier for frontier in self.global_frontier_points if self.map_data[real_pose_to_map_grid_pos(frontier[0], frontier[1], self.map.info.origin, self.map.info.resolution)[::-1]] == CellType.UNKNOWN]
@@ -433,37 +841,80 @@ class Task1(Node):
         # Filter: Mean shift clustering to find the goal position
         if len(self.global_frontier_points) == 0 and len(self.local_frontier_points) == 0:
             return
-        clustered_frontiers = mean_shift_clustering(self.global_frontier_points + self.local_frontier_points, 1.0, max_iteration=200, tolerance=5e-3)
+        self.clustered_frontiers = mean_shift_clustering(self.global_frontier_points + self.local_frontier_points, 1.0)
+        self.global_frontier_points = []
+        self.local_frontier_points = copy(self.clustered_frontiers) # Store the clustered frontiers as local frontiers
+        
+        # Ignore invalid frontier: occupied or very low information gain
+        # TODO: Use threshold from cost map to filter
+        ignore_idx = []
+        for idx in range(len(self.clustered_frontiers)):
+            grid_x_idx, grid_y_idx = real_pose_to_map_grid_pos(self.clustered_frontiers[idx][0], self.clustered_frontiers[idx][1], self.map.info.origin, self.map.info.resolution)
+            # info score (gain) is the number of unknown cells within a certain radius r
+            if get_information_score(self.map_data, grid_x_idx, grid_y_idx, 8, CellType.UNKNOWN) < 0.15:
+                ignore_idx.append(idx)
+            elif not check_satisfy_safety_margin(self.map_data, grid_x_idx, grid_y_idx, 5, CellType.OCCUPIED):
+                ignore_idx.append(idx)
+        self.clustered_frontiers = [frontier for idx, frontier in enumerate(self.clustered_frontiers) if idx not in ignore_idx]
 
+    def task_allocator_timer_cb(self):
         # State routine and transition
         if self.state == ExplorationStatus.ROTATING_SCAN:
             if self.rotate_scan_time >= self.rotate_scan_duration:
                 self.state = ExplorationStatus.ROTATING_SCAN_DONE
                 self.rotate_scan_time = 0.0
                 self.get_logger().info("Rotating scan done")
+                self.map_updated = False
             else:
                 self.rotate_scan_time += 0.2
                 rotate_cmd = Twist()
                 rotate_cmd.angular.z = 0.8
                 self.vel_pub.publish(rotate_cmd)
         elif self.state == ExplorationStatus.ROTATING_SCAN_DONE:
-            if len(clustered_frontiers) == 0:
+            if not self.map_updated:
+                return
+            if len(self.clustered_frontiers) == 0:
                 return
             # Score the frontiers and select the best one
             best_score = float('-inf')
             best_frontier = None
-            for clustered_frontier in clustered_frontiers:
+            for clustered_frontier in self.clustered_frontiers:
                 grid_x_idx, grid_y_idx = real_pose_to_map_grid_pos(clustered_frontier[0], clustered_frontier[1], self.map.info.origin, self.map.info.resolution)
                 # info score is the number of unknown cells within a certain radius r
-                info_score = count_pixels_with_value_around_point(self.map_data, grid_x_idx, grid_y_idx, 10, CellType.UNKNOWN)
+                info_score = get_information_score(self.map_data, grid_x_idx, grid_y_idx, 10, CellType.UNKNOWN)
                 energy_cost = np.sqrt((clustered_frontier[0] - self.robot_current_position[0])**2 + (clustered_frontier[1] - self.robot_current_position[1])**2)
-                c1 = 1.0 if energy_cost > 0.24 else 2.0
-                score = c1 * info_score - 1.0 * energy_cost
+                c1 = 20.0 if energy_cost > 0.24 else 40.0
+                score = c1 * info_score - 20.0 * energy_cost
                 if score > best_score:
                     best_score = score
                     best_frontier = clustered_frontier
             self.current_goal = best_frontier
+
+            #self.navigator.path.header.stamp = self.get_clock().now().to_msg()
+            send_goal_result = self.navigator.send_goal(self.robot_current_position, self.current_goal, self.map_data, self.map.info)
+            if send_goal_result:
+                # Publish for visualization
+                self.path_pub.publish(self.navigator.path)
+
             self.get_logger().info(f"Best frontier: {best_frontier}")
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.id = 0
+            marker.ns = "current_goal"
+            marker.type = Marker.POINTS
+            marker.action = Marker.ADD
+            marker.scale.x = 0.10
+            marker.scale.y = 0.10
+            marker.color.a = 1.0
+            marker.color.r = 1.0
+            marker.color.g = 1.0
+            marker.color.b = 0.2
+            point = Point()
+            point.x, point.y = self.current_goal[0], self.current_goal[1]
+            marker.points.append(point)
+            self.goal_pub.publish(marker)
+
             self.state = ExplorationStatus.NAVIGATE_TO_FRONTIER
         elif self.state == ExplorationStatus.NAVIGATE_TO_FRONTIER:
             # Navigate to the goal
@@ -473,6 +924,32 @@ class Task1(Node):
                 self.state = ExplorationStatus.ROTATING_SCAN
                 self.rotate_scan_time = 0.0
                 self.current_goal = None
+                
+                marker = Marker()
+                marker.header.frame_id = "map"
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.id = 0
+                marker.ns = "current_goal"
+                marker.action = Marker.DELETEALL
+                self.goal_pub.publish(marker)
+            else:
+                marker = Marker()
+                marker.header.frame_id = "map"
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.id = 0
+                marker.ns = "current_goal"
+                marker.type = Marker.POINTS
+                marker.action = Marker.ADD
+                marker.scale.x = 0.10
+                marker.scale.y = 0.10
+                marker.color.a = 1.0
+                marker.color.r = 1.0
+                marker.color.g = 1.0
+                marker.color.b = 0.2
+                point = Point()
+                point.x, point.y = self.current_goal[0], self.current_goal[1]
+                marker.points.append(point)
+                self.goal_pub.publish(marker)
             # TODO: Select the best frontier as above
             pass
         else:
