@@ -110,13 +110,14 @@ class Map():
         return round((y_pos - self.limits[2]) / self.map_info.resolution), round((x_pos - self.limits[0]) / self.map_info.resolution)
 
 class MapProcessor():
-    def __init__(self, map_data, map_info: MapMetaData):
+    def __init__(self, map_data, map_info: MapMetaData, current_pos):
         self.map = Map(map_data, map_info)
         self.inf_map_img_array = np.zeros(self.map.image_array.shape)
         self.map_graph = Tree()
+        self.current_pose = current_pos # Used to erode the obstacles in case the start point is too close to the wall
 
         # Change these initialization if needed
-        kr = self.rect_kernel(11,1) # Inflate a safety margin for turtlebot ( > 0.2m / 0.05)
+        kr = self.rect_kernel(12,1) # Inflate a safety margin for turtlebot ( > 0.2m / 0.05)
         self.inflate_map(kr,True)
         self.get_graph_from_map()
 
@@ -148,6 +149,13 @@ class MapProcessor():
             for j in range(self.map.image_array.shape[1]):
                 if self.map.image_array[i][j] == 255:
                     self.__inflate_obstacle(kernel,self.inf_map_img_array,i,j,absolute)
+        # Directly set 0 around the current position with radius 5 pixels
+        y_pixel_idx, x_pixel_idx = self.map.get_closest_pixel(self.current_pose[0], self.current_pose[1])
+        for i in range(y_pixel_idx-5, y_pixel_idx+6):
+            for j in range(x_pixel_idx-5, x_pixel_idx+6):
+                if (i >= 0) and (i < self.map.image_array.shape[0]) and (j >= 0) and (j < self.map.image_array.shape[1]):
+                    self.inf_map_img_array[i][j] = 0
+
         r = np.max(self.inf_map_img_array)-np.min(self.inf_map_img_array)
         if r == 0:
             r = 1
@@ -307,8 +315,10 @@ class AStar():
         path = []
         dist = 0
         # Place code here
-        print(f"via: {self.via}, sn: {sn.name}, en: {en.name}")
+        print(f"sn: {sn.name}, en: {en.name}")
         current_node_key = self.via[en.name]
+        if current_node_key == 0:
+            return path, dist
         path.append(en.name)
         dist = self.dist[en.name]
         while current_node_key != sn.name:
@@ -325,7 +335,7 @@ import matplotlib.pyplot as plt
 import time
 
 class DifferentialDriveMPC:
-    def __init__(self, dt=0.1, N=20, wheel_base=0.288, v_max=0.25, omega_max=0.5):
+    def __init__(self, dt=0.2, N=20, wheel_base=0.288, v_max=0.25, omega_max=0.5):
         """
         Initialize the MPC controller for a differential drive robot.
         
@@ -363,7 +373,7 @@ class DifferentialDriveMPC:
         # Weights for state and control costs
         Q = np.diag([100, 100, 0])  # State error weights
         R = np.diag([1.5, 1.5])  # Control effort weights
-        S = 100 # Straight path line deviation weights
+        S = 160 # Straight path line deviation weights
 
         start = start.reshape((3, 1))  # Shape (3, 1)
 
@@ -493,11 +503,12 @@ class Navigator():
     
     def send_goal(self, current_pos, goal, map_data, map_info):
         # if too close, don't change goal
-        if self.current_goal_ and ((self.current_goal_[0] - goal[0])**2 + (self.current_goal_[1] - goal[1])**2) < 0.05**2:
-            return False
+        #if self.current_goal_ and ((self.current_goal_[0] - goal[0])**2 + (self.current_goal_[1] - goal[1])**2) < 0.05**2:
+        #    print("Too close to the goal, ignore")
+        #    return False
         self.current_goal_ = goal
         # Initialize map processor
-        self.map_processor_ = MapProcessor(map_data, map_info)
+        self.map_processor_ = MapProcessor(map_data, map_info, current_pos)
         # Visualize for debug
         #import matplotlib.pyplot as plt
         #fig, ax = plt.subplots(dpi=100)
@@ -513,14 +524,15 @@ class Navigator():
         end_y_idx, end_x_idx = self.map_processor_.map.get_closest_pixel(goal[0], goal[1])
         if (f'{start_y_idx},{start_x_idx}' not in self.map_processor_.map_graph.g) or (f'{end_y_idx},{end_x_idx}' not in self.map_processor_.map_graph.g):
             if (f'{start_y_idx},{start_x_idx}' not in self.map_processor_.map_graph.g):
-                pass
+                print(f"Start point {start_y_idx},{start_x_idx} not in the graph")
             if (f'{end_y_idx},{end_x_idx}' not in self.map_processor_.map_graph.g):
-                pass
+                print(f"End point {end_y_idx},{end_x_idx} not in the graph")
+            print("Failed to find path")
             return False
         
         solved = a_star_planner.solve(self.map_processor_.map_graph.g[f'{start_y_idx},{start_x_idx}'], self.map_processor_.map_graph.g[f'{end_y_idx},{end_x_idx}'], visualize=False)
         if not solved:
-            #pass
+            print("Failed to solve A*")
             return False
         
         #print(planner.dist)
@@ -570,8 +582,8 @@ class Navigator():
         # Update state based on dynamics
         state = mpc.robot_dynamics(state, u_opt).full().flatten() * mpc.dt + state
 
-        print(f"u_opt: {u_opt}")
-        print(f"v: {v}, omega: {omega}")
+        #print(f"u_opt: {u_opt}")
+        #print(f"v: {v}, omega: {omega}")
 
         speed = v
         heading = omega
@@ -703,8 +715,8 @@ def extract_best_frontier_point(frontier_points, map_data, map_info, current_pos
         # info score is the number of unknown cells within a certain radius r
         info_score = get_information_score(map_data, grid_x_idx, grid_y_idx, 10, CellType.UNKNOWN)
         energy_cost = np.sqrt((frontier[0] - current_position[0])**2 + (frontier[1] - current_position[1])**2)
-        c1 = 20.0 if energy_cost > 0.24 else 40.0
-        score = c1 * info_score - 20.0 * energy_cost
+        c1 = 20.0 if energy_cost > 0.5 else 30.0
+        score = c1 * info_score - 30.0 * energy_cost
         if score > best_score:
             best_score = score
             best_frontier = frontier
@@ -859,7 +871,7 @@ class Task1(Node):
 
         self.state = ExplorationStatus.ROTATING_SCAN
         self.rotate_scan_time = 0.0
-        self.rotate_scan_duration = 4.0
+        self.rotate_scan_duration = 2.0
         self.map_updated = False
 
         self.navigator = Navigator()
@@ -1054,7 +1066,8 @@ class Task1(Node):
         # Check if the current goal is no longer a frontier
         # Check if the information score of the current goal is still high
         grid_x_idx, grid_y_idx = real_pose_to_map_grid_pos(self.current_goal[0], self.current_goal[1], self.map.info.origin, self.map.info.resolution)
-        if get_information_score(self.map_data, grid_x_idx, grid_y_idx, 8, CellType.UNKNOWN) < 0.01:
+        if get_information_score(self.map_data, grid_x_idx, grid_y_idx, 8, CellType.UNKNOWN) < 0.01 or \
+           not check_satisfy_safety_margin(self.map_data, grid_x_idx, grid_y_idx, 5, CellType.OCCUPIED):
             #self.get_logger().info("Replan: Current goal is no longer a frontier")
             self.state = ExplorationStatus.ROTATING_SCAN_DONE
             self.rotate_scan_time = 0.0
@@ -1072,7 +1085,7 @@ class Task1(Node):
             else:
                 self.rotate_scan_time += 0.2
                 rotate_cmd = Twist()
-                rotate_cmd.angular.z = 0.8
+                rotate_cmd.angular.z = 0.2
                 self.vel_pub.publish(rotate_cmd)
         elif self.state == ExplorationStatus.ROTATING_SCAN_DONE:
             if not self.map_updated:
@@ -1087,6 +1100,12 @@ class Task1(Node):
             if send_goal_result:
                 # Publish for visualization
                 self.path_pub.publish(self.navigator.path)
+            else:
+                self.get_logger().error("Failed to send goal")
+                self.state = ExplorationStatus.ROTATING_SCAN
+                self.rotate_scan_time = 0.0
+                self.current_goal = None
+                return
 
             self.get_logger().info(f"Best frontier: {self.current_goal}")
             marker = Marker()
@@ -1111,7 +1130,7 @@ class Task1(Node):
         elif self.state == ExplorationStatus.NAVIGATE_TO_FRONTIER:
             # Navigate to the goal
             # TODO: Check if the goal is reached
-            if np.sqrt((self.robot_current_position[0] - self.current_goal[0])**2 + (self.robot_current_position[1] - self.current_goal[1])**2) < 0.07:
+            if np.sqrt((self.robot_current_position[0] - self.current_goal[0])**2 + (self.robot_current_position[1] - self.current_goal[1])**2) < 0.05:
                 self.get_logger().info("Goal reached")
                 self.state = ExplorationStatus.ROTATING_SCAN
                 self.rotate_scan_time = 0.0
@@ -1158,6 +1177,7 @@ class Task1(Node):
             self.navigator.path.poses.pop(0)
         if len(self.navigator.path.poses) <= 1:
             self.navigator.path.poses = []
+            self.current_goal = None
             self.state = ExplorationStatus.ROTATING_SCAN
             return
         # Follow the path (heading to waypoint[1] from waypoint[0])
