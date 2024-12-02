@@ -14,8 +14,10 @@ from enum import IntEnum
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from sklearn.cluster import MeanShift
+from scipy.spatial.transform import Rotation
 from copy import copy
 
+import casadi as ca # For MPC
 
 # ===================== Map Processor ========================
 import matplotlib.pyplot as plt
@@ -114,7 +116,7 @@ class MapProcessor():
         self.map_graph = Tree()
 
         # Change these initialization if needed
-        kr = self.rect_kernel(9,1) # Inflate a safety margin for turtlebot ( > 0.2m / 0.05)
+        kr = self.rect_kernel(11,1) # Inflate a safety margin for turtlebot ( > 0.2m / 0.05)
         self.inflate_map(kr,True)
         self.get_graph_from_map()
 
@@ -305,6 +307,7 @@ class AStar():
         path = []
         dist = 0
         # Place code here
+        print(f"via: {self.via}, sn: {sn.name}, en: {en.name}")
         current_node_key = self.via[en.name]
         path.append(en.name)
         dist = self.dist[en.name]
@@ -314,6 +317,143 @@ class AStar():
         path.append(sn.name)
         path.reverse()
         return path, dist
+
+# ======================== Path Following Controller ========================
+import casadi as ca
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+
+class DifferentialDriveMPC:
+    def __init__(self, dt=0.1, N=20, wheel_base=0.288, v_max=0.25, omega_max=0.5):
+        """
+        Initialize the MPC controller for a differential drive robot.
+        
+        Args:
+            dt: Time step duration
+            N: Prediction horizon
+            wheel_base: Distance between the two wheels
+            v_max: Maximum linear velocity
+            omega_max: Maximum angular velocity    
+        """
+        self.dt = dt
+        self.N = N  # Prediction horizon
+        self.L = wheel_base
+        self.v_max = v_max
+        self.omega_max = omega_max
+
+        # Create Opti object for optimization
+        self.opti = ca.Opti()
+
+        # Define optimization variables: state trajectory [x, y, theta]
+        self.X = self.opti.variable(3, self.N + 1)  # 3 states: [x, y, theta]
+        self.U = self.opti.variable(2, self.N)  # 2 inputs: [v, omega]
+
+    def setup_mpc(self, start, goal, last_goal):
+        """
+        Set up the MPC problem, including objective and constraints.
+        """
+        # Initialize the objective function
+        self.opti = ca.Opti()
+        # Define optimization variables: state trajectory [x, y, theta]
+        self.X = self.opti.variable(3, self.N + 1)  # 3 states: [x, y, theta]
+        self.U = self.opti.variable(2, self.N)  # 2 inputs: [v, omega]
+        objective = 0
+
+        # Weights for state and control costs
+        Q = np.diag([100, 100, 0])  # State error weights
+        R = np.diag([1.5, 1.5])  # Control effort weights
+        S = 100 # Straight path line deviation weights
+
+        start = start.reshape((3, 1))  # Shape (3, 1)
+
+        # Add the initial state constraint
+        self.opti.subject_to(self.X[:, 0] == start)
+
+        # Loop over the prediction horizon to add dynamics and input constraints
+        for t in range(self.N):
+            # State error cost
+            state_error = self.X[:, t] - goal
+            objective += ca.mtimes([state_error.T, Q, state_error]) # i.e. err_x^2 + err_y^2 + err_theta^2
+
+            # Control effort cost
+            control_effort = self.U[:, t]
+            objective += ca.mtimes([control_effort.T, R, control_effort])
+            # self.opti.minimize(objective)
+
+            # Path line deviation cost
+            numerator = ((goal[1] - last_goal[1]) * self.X[0,t] - (goal[0] - last_goal[0]) * self.X[1,t] + goal[0] * last_goal[1] - goal[1] * last_goal[0])**2
+            denominator = np.sqrt((goal[1] - last_goal[1])**2 + (goal[0] - last_goal[0])**2)
+            if denominator < 1e-6:
+                path_line_deviation = 0
+            else:
+                path_line_deviation = numerator / denominator
+            objective += S * path_line_deviation
+
+            # Dynamics constraint: X[t+1] = X[t] + f(X[t], U[t]) * dt
+            next_state = self.X[:, t] + self.robot_dynamics(self.X[:, t], self.U[:, t]) * self.dt
+            self.opti.subject_to(self.X[:, t + 1] == next_state)
+
+            # Input constraints (inequality constraints)
+            self.opti.subject_to(self.U[0, t] <= self.v_max)  # v <= v_max
+            self.opti.subject_to(self.U[0, t] >= -self.v_max)  # v >= -v_max
+            self.opti.subject_to(self.U[1, t] <= self.v_max)  # omega <= omega_max
+            self.opti.subject_to(self.U[1, t] >= -self.v_max)  # omega >= -mega_max
+
+            self.opti.minimize(objective)
+
+        # Set the objective function to minimize
+        self.opti.minimize(objective)
+
+
+    def robot_dynamics(self, state, control):
+        """
+        Nonlinear dynamics of the differential drive robot.
+        """
+        x, y, theta = state[0], state[1], state[2]
+
+        v= (control[0] + control[1]) / 2
+        omega= (-control[0] + control[1]) / self.L
+
+        # Compute state derivatives
+        dx = v * ca.cos(theta)
+        dy = v * ca.sin(theta)
+        dtheta = omega
+
+        return ca.vertcat(dx, dy, dtheta)
+
+    def solve_mpc(self, start, goal, last_goal):
+        """
+        Solve the MPC optimization problem.
+        """
+        # Set up the MPC problem
+        self.setup_mpc(start, goal, last_goal)
+
+        # Provide an initial guess for the solver
+        self.opti.set_initial(self.X, np.tile(start, (self.N + 1, 1)).T)
+        self.opti.set_initial(self.U, np.zeros((2, self.N)))
+
+
+        # Solver options
+        opts = {'ipopt.print_level': 0, 'print_time': 0, 'ipopt.tol': 1e-4}
+        self.opti.solver('ipopt', opts)
+
+        try:
+            # Solve the problem
+            solution = self.opti.solve()
+
+            # Extract the optimal control inputs and state trajectory
+            opt_U = solution.value(self.U)
+            opt_X = solution.value(self.X)
+
+            return opt_U[:, 0], opt_X
+
+        except RuntimeError as e:
+            print(f"Solver failed: {e}")
+            print("Debugging with opti.debug.value:")
+            print("X:", self.opti.debug.value(self.X))
+            print("U:", self.opti.debug.value(self.U))
+            raise
 
 # ================================ Navigator =================================
 def waypoint_reduction(path_poses: list, epsilon):
@@ -398,10 +538,45 @@ class Navigator():
         self.path.poses = waypoint_reduction(self.path.poses, 0.02)
         return True
 
-    def path_following(self):
+    def path_following(self, vehicle_pose_trans, target_waypoint_pose, last_waypoint_pose):
         # MPC controller
         # return Twist msg for cmd_vel or None if goal reached
-        pass
+        # Convert from SE3 (4x4 matrix) to Pose
+        vehicle_pose = Pose()
+        vehicle_pose.position.x = vehicle_pose_trans[0, 3]
+        vehicle_pose.position.y = vehicle_pose_trans[1, 3]
+        vehicle_pose.orientation.x, vehicle_pose.orientation.y, vehicle_pose.orientation.z, vehicle_pose.orientation.w = Rotation.from_matrix(vehicle_pose_trans[0:3, 0:3]).as_quat()
+        current_orientation = np.arctan2(vehicle_pose.orientation.z, vehicle_pose.orientation.w)*2
+        #current_orientation = TODO...
+        start = np.array([vehicle_pose.position.x, vehicle_pose.position.y, current_orientation])
+        # NOTE: MUST use arctan2 instead of arctan!
+        #goal_orientation = TODO...
+        # WARNING: TODO: Handle [-pi, pi] wrap-up problem for orientation
+        goal = np.array([target_waypoint_pose.pose.position.x, target_waypoint_pose.pose.position.y, 0.0])
+
+        # Used to generate path line from last waypoint to the next waypoint
+        last_goal = np.array([last_waypoint_pose.pose.position.x, last_waypoint_pose.pose.position.y, 0])
+        
+        # Initialize the MPC controller
+        mpc = DifferentialDriveMPC()
+
+        print(f"start: {start}, goal: {goal}, last_goal: {last_goal}")
+
+        state = start
+        # Solve MPC to get the optimal control input
+        u_opt, pred_trajectory = mpc.solve_mpc(state, goal, last_goal)
+        v = (u_opt[0] + u_opt[1]) / 2
+        omega= (-u_opt[0] + u_opt[1]) / mpc.L
+        # Update state based on dynamics
+        state = mpc.robot_dynamics(state, u_opt).full().flatten() * mpc.dt + state
+
+        print(f"u_opt: {u_opt}")
+        print(f"v: {v}, omega: {omega}")
+
+        speed = v
+        heading = omega
+        return speed, heading
+
 
 
 # Import other python packages that you think necessary
@@ -648,6 +823,7 @@ class Task1(Node):
         self.filter_timer = self.create_timer(0.4, self.filter_timer_cb)
         self.replan_timer = self.create_timer(0.4, self.replan_timer_cb)
         self.task_allocator_timer = self.create_timer(0.2, self.task_allocator_timer_cb)
+        self.path_follow_timer = self.create_timer(0.1, self.path_follow_timer_cb)
         # Fill in the initialization member variables that you need
         self.map_subscriber = self.create_subscription(
             OccupancyGrid,
@@ -683,7 +859,7 @@ class Task1(Node):
 
         self.state = ExplorationStatus.ROTATING_SCAN
         self.rotate_scan_time = 0.0
-        self.rotate_scan_duration = 3.5
+        self.rotate_scan_duration = 4.0
         self.map_updated = False
 
         self.navigator = Navigator()
@@ -970,6 +1146,27 @@ class Task1(Node):
             pass
         else:
             self.get_logger().info("Invalid state")
+    
+    def path_follow_timer_cb(self):
+        if self.state != ExplorationStatus.NAVIGATE_TO_FRONTIER:
+            return
+        if len(self.navigator.path.poses) <= 1:
+            self.state = ExplorationStatus.ROTATING_SCAN
+            return
+        # Check if the current waypoint is reached
+        if np.sqrt((self.robot_current_position[0] - self.navigator.path.poses[1].pose.position.x)**2 + (self.robot_current_position[1] - self.navigator.path.poses[1].pose.position.y)**2) < 0.06:
+            self.navigator.path.poses.pop(0)
+        if len(self.navigator.path.poses) <= 1:
+            self.navigator.path.poses = []
+            self.state = ExplorationStatus.ROTATING_SCAN
+            return
+        # Follow the path (heading to waypoint[1] from waypoint[0])
+        vx, omega = self.navigator.path_following(self.robot_pose_trans, self.navigator.path.poses[1], self.navigator.path.poses[0])
+        self.get_logger().info(f"vx: {vx}, omega: {omega}")
+        cmd_vel = Twist()
+        cmd_vel.linear.x = vx
+        cmd_vel.angular.z = omega
+        self.vel_pub.publish(cmd_vel)
     
     # Define function(s) that complete the (automatic) mapping task
     def tf_callback(self, tf_msg: TFMessage):
